@@ -22,8 +22,18 @@ CORS(app,
 data_cache = None
 cache_time = None
 
+def clean_value(value):
+    """Limpiar y convertir valores para evitar errores de validación"""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and (value != value):  # NaN check
+        return 0
+    if isinstance(value, str):
+        return value.strip()
+    return str(value)
+
 def get_redash_data():
-    """Obtener datos de Redash con cache"""
+    """Obtener datos de Redash con cache y limpieza de datos"""
     global data_cache, cache_time
     
     if data_cache and cache_time and (time.time() - cache_time) < 300:
@@ -38,15 +48,35 @@ def get_redash_data():
         rows = raw.get("query_result", {}).get("data", {}).get("rows", [])
         columns = raw.get("query_result", {}).get("data", {}).get("columns", [])
         
-        processed_data = []
-        column_names = [col.get('name', f'col_{i}') if isinstance(col, dict) else str(col) for i, col in enumerate(columns)]
+        # Limpiar nombres de columnas
+        column_names = []
+        for i, col in enumerate(columns):
+            if isinstance(col, dict):
+                name = col.get('name', f'col_{i}')
+            else:
+                name = str(col) if col is not None else f'col_{i}'
+            # Limpiar nombre de columna
+            name = name.strip().replace(' ', '_').replace('-', '_')
+            if not name:
+                name = f'col_{i}'
+            column_names.append(name)
         
-        for row in rows:
+        # Procesar y limpiar datos
+        processed_data = []
+        for row_idx, row in enumerate(rows):
+            if not isinstance(row, (list, tuple)):
+                continue
+                
             row_dict = {}
             for i, value in enumerate(row):
                 if i < len(column_names):
-                    row_dict[column_names[i]] = value
-            processed_data.append(row_dict)
+                    column_name = column_names[i]
+                    cleaned_value = clean_value(value)
+                    row_dict[column_name] = cleaned_value
+            
+            # Solo agregar filas que tengan al menos un valor no vacío
+            if any(str(v).strip() for v in row_dict.values() if v):
+                processed_data.append(row_dict)
         
         result = {
             "success": True,
@@ -55,7 +85,8 @@ def get_redash_data():
                 "total_records": len(processed_data),
                 "columns": column_names,
                 "source": "Redash Query 3654",
-                "retrieved_at": datetime.now().isoformat()
+                "retrieved_at": datetime.now().isoformat(),
+                "data_cleaned": True
             }
         }
         
@@ -320,7 +351,7 @@ def handle_mcp_request(rpc_request):
         })
 
 def handle_get_orders(args, request_id):
-    """Manejar get_orders con mejor formato para Claude Desktop"""
+    """Manejar get_orders con validación estricta para Claude Desktop"""
     data = get_redash_data()
     
     if not data.get("success"):
@@ -336,44 +367,83 @@ def handle_get_orders(args, request_id):
         })
     
     orders = data.get("data", [])
-    limit = min(args.get("limit", 10), 100)
+    
+    # Validar y limpiar argumentos
+    try:
+        limit = int(args.get("limit", 10))
+        limit = max(1, min(limit, 100))  # Entre 1 y 100
+    except (ValueError, TypeError):
+        limit = 10
+    
     format_type = args.get("format", "summary")
+    if format_type not in ["summary", "detailed", "json"]:
+        format_type = "summary"
     
-    if isinstance(limit, int) and limit > 0:
-        orders = orders[:limit]
+    # Aplicar límite de forma segura
+    orders = orders[:limit] if orders else []
     
-    if format_type == "json":
-        result_text = f"📊 **Orders Data** (JSON Format)\n\n**Records returned:** {len(orders)}\n\n```json\n{json.dumps(orders[:5], indent=2, ensure_ascii=False)}\n```"
-        if len(orders) > 5:
-            result_text += f"\n\n*Showing first 5 of {len(orders)} total records*"
-    
-    elif format_type == "detailed":
-        result_text = f"📊 **Detailed Orders Report**\n\n**Total records:** {len(orders)}\n\n"
-        for i, order in enumerate(orders[:10], 1):
-            result_text += f"### Order #{i}\n"
-            for key, value in order.items():
-                result_text += f"- **{key}:** {value}\n"
-            result_text += "\n"
-        if len(orders) > 10:
-            result_text += f"*... and {len(orders) - 10} more orders available*"
-    
-    else:  # summary
-        result_text = f"📊 **Orders Summary**\n\n**Records retrieved:** {len(orders)}\n\n"
-        if orders:
-            for i, order in enumerate(orders[:5], 1):
-                order_summary = []
-                for key, value in list(order.items())[:3]:
-                    order_summary.append(f"**{key}:** {value}")
-                
-                result_text += f"**{i}.** {' • '.join(order_summary)}\n"
+    try:
+        if format_type == "json":
+            # Validar que los datos son serializables
+            sample_data = orders[:5] if orders else []
+            json_str = json.dumps(sample_data, indent=2, ensure_ascii=False, default=str)
             
+            result_text = f"📊 **Orders Data** (JSON Format)\n\n**Records returned:** {len(orders)}\n\n```json\n{json_str}\n```"
             if len(orders) > 5:
-                result_text += f"\n*... and {len(orders) - 5} more orders available*\n"
+                result_text += f"\n\n*Showing first 5 of {len(orders)} total records*"
         
-        metadata = data.get("metadata", {})
-        result_text += f"\n---\n**📍 Source:** {metadata.get('source', 'Unknown')}\n"
-        result_text += f"**🕐 Retrieved:** {metadata.get('retrieved_at', 'Unknown')}\n"
-        result_text += f"**📊 Columns:** {len(metadata.get('columns', []))}"
+        elif format_type == "detailed":
+            result_text = f"📊 **Detailed Orders Report**\n\n**Total records:** {len(orders)}\n\n"
+            
+            for i, order in enumerate(orders[:10], 1):
+                if not isinstance(order, dict):
+                    continue
+                    
+                result_text += f"### Order #{i}\n"
+                for key, value in order.items():
+                    # Asegurar que key y value son strings válidos
+                    safe_key = str(key) if key is not None else "unknown_field"
+                    safe_value = str(value) if value is not None else "N/A"
+                    result_text += f"- **{safe_key}:** {safe_value}\n"
+                result_text += "\n"
+                
+            if len(orders) > 10:
+                result_text += f"*... and {len(orders) - 10} more orders available*"
+        
+        else:  # summary
+            result_text = f"📊 **Orders Summary**\n\n**Records retrieved:** {len(orders)}\n\n"
+            
+            if orders:
+                for i, order in enumerate(orders[:5], 1):
+                    if not isinstance(order, dict):
+                        continue
+                        
+                    order_summary = []
+                    order_items = list(order.items())[:3]  # Primeros 3 campos
+                    
+                    for key, value in order_items:
+                        safe_key = str(key) if key is not None else "field"
+                        safe_value = str(value) if value is not None else "N/A"
+                        # Truncar valores muy largos
+                        if len(safe_value) > 50:
+                            safe_value = safe_value[:47] + "..."
+                        order_summary.append(f"**{safe_key}:** {safe_value}")
+                    
+                    if order_summary:
+                        result_text += f"**{i}.** {' • '.join(order_summary)}\n"
+                
+                if len(orders) > 5:
+                    result_text += f"\n*... and {len(orders) - 5} more orders available*\n"
+            
+            # Metadata segura
+            metadata = data.get("metadata", {})
+            result_text += f"\n---\n**📍 Source:** {metadata.get('source', 'Unknown')}\n"
+            result_text += f"**🕐 Retrieved:** {metadata.get('retrieved_at', 'Unknown')}\n"
+            result_text += f"**📊 Columns:** {len(metadata.get('columns', []))}"
+    
+    except Exception as e:
+        # Fallback en caso de error de formateo
+        result_text = f"📊 **Orders Data**\n\n**Records found:** {len(orders)}\n\n*Data retrieved successfully but encountered formatting issues. Raw data available via JSON format.*\n\n**Error:** {str(e)}"
     
     return create_mcp_response({
         "jsonrpc": "2.0",
@@ -381,19 +451,13 @@ def handle_get_orders(args, request_id):
             "content": [{
                 "type": "text",
                 "text": result_text
-            }],
-            "_meta": {
-                "tool": "get_orders",
-                "format": format_type,
-                "count": len(orders),
-                "timestamp": datetime.now().isoformat()
-            }
+            }]
         },
         "id": request_id
     })
 
 def handle_get_orders_stats(request_id):
-    """Manejar estadísticas de órdenes"""
+    """Manejar estadísticas con validación robusta"""
     data = get_redash_data()
     
     if not data.get("success"):
@@ -411,26 +475,50 @@ def handle_get_orders_stats(request_id):
     orders = data.get("data", [])
     metadata = data.get("metadata", {})
     
-    result_text = f"📈 **Orders Database Statistics**\n\n"
-    result_text += f"**📊 Total Records:** {len(orders):,}\n"
-    result_text += f"**🏷️ Total Columns:** {len(metadata.get('columns', []))}\n"
-    result_text += f"**🔗 Data Source:** {metadata.get('source', 'Unknown')}\n"
-    result_text += f"**⏰ Last Updated:** {metadata.get('retrieved_at', 'Unknown')}\n\n"
-    
-    columns = metadata.get("columns", [])
-    if columns:
-        result_text += "**📋 Available Columns:**\n"
-        for i, col in enumerate(columns, 1):
-            result_text += f"{i}. `{col}`\n"
-    
-    if orders:
-        result_text += f"\n**🔍 Sample Data Preview:**\n"
-        sample_order = orders[0]
-        for key, value in list(sample_order.items())[:5]:
-            result_text += f"- **{key}:** `{value}` *({type(value).__name__})*\n"
+    try:
+        result_text = f"📈 **Orders Database Statistics**\n\n"
+        result_text += f"**📊 Total Records:** {len(orders):,}\n"
         
-        if len(sample_order) > 5:
-            result_text += f"*... and {len(sample_order) - 5} more fields per record*\n"
+        columns = metadata.get("columns", [])
+        result_text += f"**🏷️ Total Columns:** {len(columns)}\n"
+        result_text += f"**🔗 Data Source:** {metadata.get('source', 'Unknown')}\n"
+        result_text += f"**⏰ Last Updated:** {metadata.get('retrieved_at', 'Unknown')}\n"
+        
+        if metadata.get('data_cleaned'):
+            result_text += f"**✅ Data Status:** Cleaned and validated\n"
+        
+        result_text += "\n"
+        
+        if columns:
+            result_text += "**📋 Available Columns:**\n"
+            for i, col in enumerate(columns[:20], 1):  # Limitar a 20 columnas
+                safe_col = str(col) if col is not None else f"column_{i}"
+                result_text += f"{i}. `{safe_col}`\n"
+            
+            if len(columns) > 20:
+                result_text += f"*... and {len(columns) - 20} more columns*\n"
+        
+        if orders and isinstance(orders[0], dict):
+            result_text += f"\n**🔍 Sample Data Preview:**\n"
+            sample_order = orders[0]
+            sample_items = list(sample_order.items())[:5]
+            
+            for key, value in sample_items:
+                safe_key = str(key) if key is not None else "unknown"
+                safe_value = str(value) if value is not None else "N/A"
+                value_type = type(value).__name__
+                
+                # Truncar valores largos
+                if len(safe_value) > 100:
+                    safe_value = safe_value[:97] + "..."
+                
+                result_text += f"- **{safe_key}:** `{safe_value}` *({value_type})*\n"
+            
+            if len(sample_order) > 5:
+                result_text += f"*... and {len(sample_order) - 5} more fields per record*\n"
+    
+    except Exception as e:
+        result_text = f"📈 **Orders Database Statistics**\n\n**Records:** {len(orders)}\n**Status:** Data available but stats generation failed\n**Error:** {str(e)}"
     
     return create_mcp_response({
         "jsonrpc": "2.0",
@@ -444,9 +532,14 @@ def handle_get_orders_stats(request_id):
     })
 
 def handle_search_orders(args, request_id):
-    """Manejar búsqueda básica en órdenes"""
-    query = args.get("query", "").lower()
-    limit = min(args.get("limit", 10), 50)
+    """Manejar búsqueda con validación mejorada"""
+    try:
+        query = str(args.get("query", "")).lower().strip()
+        limit = int(args.get("limit", 10))
+        limit = max(1, min(limit, 50))  # Entre 1 y 50
+    except (ValueError, TypeError):
+        limit = 10
+        query = ""
     
     if not query:
         return create_mcp_response({
@@ -476,26 +569,47 @@ def handle_search_orders(args, request_id):
     orders = data.get("data", [])
     matching_orders = []
     
-    # Búsqueda simple en todos los campos
-    for order in orders:
-        for key, value in order.items():
-            if query in str(value).lower():
-                matching_orders.append(order)
+    try:
+        # Búsqueda segura en todos los campos
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+                
+            found_match = False
+            for key, value in order.items():
+                try:
+                    if query in str(value).lower():
+                        matching_orders.append(order)
+                        found_match = True
+                        break
+                except:
+                    continue  # Skip problematic values
+            
+            if found_match and len(matching_orders) >= limit:
                 break
-        if len(matching_orders) >= limit:
-            break
+        
+        result_text = f"🔍 **Search Results for:** `{args.get('query')}`\n\n"
+        result_text += f"**Found:** {len(matching_orders)} matches (showing {min(len(matching_orders), limit)})\n\n"
+        
+        if matching_orders:
+            for i, order in enumerate(matching_orders[:limit], 1):
+                order_summary = []
+                order_items = list(order.items())[:3]
+                
+                for key, value in order_items:
+                    safe_key = str(key) if key is not None else "field"
+                    safe_value = str(value) if value is not None else "N/A"
+                    if len(safe_value) > 50:
+                        safe_value = safe_value[:47] + "..."
+                    order_summary.append(f"**{safe_key}:** {safe_value}")
+                
+                if order_summary:
+                    result_text += f"**{i}.** {' • '.join(order_summary)}\n"
+        else:
+            result_text += "*No orders found matching your search criteria.*"
     
-    result_text = f"🔍 **Search Results for:** `{args.get('query')}`\n\n"
-    result_text += f"**Found:** {len(matching_orders)} matches (showing {min(len(matching_orders), limit)})\n\n"
-    
-    if matching_orders:
-        for i, order in enumerate(matching_orders[:limit], 1):
-            order_summary = []
-            for key, value in list(order.items())[:3]:
-                order_summary.append(f"**{key}:** {value}")
-            result_text += f"**{i}.** {' • '.join(order_summary)}\n"
-    else:
-        result_text += "*No orders found matching your search criteria.*"
+    except Exception as e:
+        result_text = f"🔍 **Search Error**\n\n**Query:** `{args.get('query')}`\n**Error:** {str(e)}"
     
     return create_mcp_response({
         "jsonrpc": "2.0",
