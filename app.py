@@ -1,17 +1,14 @@
-# 🚀 MCP Server para Render.com - Versión de deploy
+# 🚀 MCP Server Simplificado para Render.com (Sin OAuth)
 import os
 import json
-import secrets
-import hashlib
-import base64
-from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, make_response, redirect
+import time
+from datetime import datetime
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
-from urllib.parse import urlencode
 import requests
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+app.secret_key = os.environ.get('SECRET_KEY', 'simple-secret-key')
 
 # CORS configurado para Claude
 CORS(app, 
@@ -20,17 +17,15 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
      supports_credentials=True)
 
-# Storage en memoria (en producción usarías una base de datos)
+# Cache en memoria
 data_cache = None
 cache_time = None
-oauth_clients = {}
-auth_codes = {}
-access_tokens = {}
 
 def get_redash_data():
-    """Obtener datos de Redash"""
+    """Obtener datos de Redash con cache"""
     global data_cache, cache_time
     
+    # Usar cache si es reciente (5 minutos)
     if data_cache and cache_time and (time.time() - cache_time) < 300:
         return data_cache
     
@@ -43,6 +38,7 @@ def get_redash_data():
         rows = raw.get("query_result", {}).get("data", {}).get("rows", [])
         columns = raw.get("query_result", {}).get("data", {}).get("columns", [])
         
+        # Procesar datos
         processed_data = []
         column_names = [col.get('name', f'col_{i}') if isinstance(col, dict) else str(col) for i, col in enumerate(columns)]
         
@@ -64,6 +60,7 @@ def get_redash_data():
             }
         }
         
+        # Actualizar cache
         data_cache = result
         cache_time = time.time()
         return result
@@ -83,266 +80,45 @@ def create_json_response(data, status=200):
     })
     return response
 
-def verify_token(token):
-    """Verificar token de acceso"""
-    if not token or token not in access_tokens:
-        return False
-    token_data = access_tokens[token]
-    if datetime.now() > token_data['expires']:
-        del access_tokens[token]
-        return False
-    return True
-
-# OAuth Well-Known Endpoints
-@app.route("/.well-known/oauth-authorization-server", methods=["GET", "OPTIONS"])
-def oauth_authorization_server():
-    if request.method == "OPTIONS":
-        return create_json_response({})
-    
-    base_url = request.url_root.rstrip('/')
-    return create_json_response({
-        "issuer": base_url,
-        "authorization_endpoint": f"{base_url}/oauth/authorize",
-        "token_endpoint": f"{base_url}/oauth/token",
-        "registration_endpoint": f"{base_url}/register",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
-        "code_challenge_methods_supported": ["S256", "plain"],
-        "scopes_supported": ["read", "mcp", "orders"]
-    })
-
-@app.route("/.well-known/oauth-protected-resource", methods=["GET", "OPTIONS"])
-def oauth_protected_resource():
-    if request.method == "OPTIONS":
-        return create_json_response({})
-    
-    base_url = request.url_root.rstrip('/')
-    return create_json_response({
-        "resource": base_url,
-        "authorization_servers": [f"{base_url}/.well-known/oauth-authorization-server"],
-        "scopes_supported": ["read", "mcp", "orders"],
-        "bearer_methods_supported": ["header"]
-    })
-
-# Dynamic Client Registration
-@app.route("/register", methods=["GET", "POST", "OPTIONS"])
-def register_client():
+# Endpoint principal MCP
+@app.route("/", methods=["GET", "POST", "OPTIONS"])
+def mcp_endpoint():
+    """Endpoint principal del servidor MCP"""
     if request.method == "OPTIONS":
         return create_json_response({})
     
     if request.method == "GET":
-        base_url = request.url_root.rstrip('/')
+        # Información del servidor
         return create_json_response({
-            "registration_endpoint": f"{base_url}/register",
-            "grant_types_supported": ["authorization_code"],
-            "response_types_supported": ["code"]
+            "name": "Redash Orders MCP Server",
+            "version": "1.0.0",
+            "description": "MCP server for Redash orders data (No Auth)",
+            "protocol": "Model Context Protocol v2024-11-05",
+            "status": "running",
+            "auth_required": False
         })
-    
-    try:
-        client_metadata = request.get_json() or {}
-        
-        client_id = f"claude_client_{secrets.token_urlsafe(16)}"
-        client_secret = secrets.token_urlsafe(32)
-        
-        redirect_uris = client_metadata.get("redirect_uris", [
-            "https://claude.ai/api/mcp/auth_callback",
-            "https://claude.com/api/mcp/auth_callback"
-        ])
-        
-        oauth_clients[client_id] = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "client_name": client_metadata.get("client_name", "Claude MCP Client"),
-            "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "scope": "read mcp orders"
-        }
-        
-        return create_json_response({
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "client_name": oauth_clients[client_id]["client_name"],
-            "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "scope": "read mcp orders"
-        }, 201)
-        
-    except Exception as e:
-        return create_json_response({
-            "error": "invalid_request",
-            "error_description": str(e)
-        }, 400)
-
-# OAuth Authorization
-@app.route("/oauth/authorize", methods=["GET", "OPTIONS"])
-def oauth_authorize():
-    if request.method == "OPTIONS":
-        return create_json_response({})
-    
-    try:
-        client_id = request.args.get('client_id')
-        redirect_uri = request.args.get('redirect_uri')
-        response_type = request.args.get('response_type', 'code')
-        scope = request.args.get('scope', 'read')
-        state = request.args.get('state')
-        
-        if not client_id or client_id not in oauth_clients:
-            error_params = {"error": "invalid_client"}
-            if state:
-                error_params["state"] = state
-            return redirect(f"{redirect_uri}?{urlencode(error_params)}")
-        
-        client = oauth_clients[client_id]
-        
-        if redirect_uri not in client['redirect_uris']:
-            return create_json_response({
-                "error": "invalid_request",
-                "error_description": "Invalid redirect URI"
-            }, 400)
-        
-        if response_type != 'code':
-            error_params = {"error": "unsupported_response_type"}
-            if state:
-                error_params["state"] = state
-            return redirect(f"{redirect_uri}?{urlencode(error_params)}")
-        
-        auth_code = secrets.token_urlsafe(32)
-        auth_codes[auth_code] = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "scope": scope,
-            "expires": datetime.now() + timedelta(minutes=10),
-            "used": False
-        }
-        
-        callback_params = {"code": auth_code}
-        if state:
-            callback_params["state"] = state
-        
-        return redirect(f"{redirect_uri}?{urlencode(callback_params)}")
-        
-    except Exception as e:
-        error_params = {"error": "server_error"}
-        if 'state' in locals() and state:
-            error_params["state"] = state
-        return redirect(f"{redirect_uri}?{urlencode(error_params)}")
-
-# OAuth Token
-@app.route("/oauth/token", methods=["POST", "OPTIONS"])
-def oauth_token():
-    if request.method == "OPTIONS":
-        return create_json_response({})
-    
-    try:
-        if request.content_type == 'application/json':
-            data = request.get_json() or {}
-        else:
-            data = request.form.to_dict()
-        
-        grant_type = data.get('grant_type')
-        code = data.get('code')
-        client_id = data.get('client_id')
-        
-        if grant_type != 'authorization_code':
-            return create_json_response({
-                "error": "unsupported_grant_type"
-            }, 400)
-        
-        if not code or code not in auth_codes:
-            return create_json_response({
-                "error": "invalid_grant"
-            }, 400)
-        
-        auth_data = auth_codes[code]
-        
-        if datetime.now() > auth_data['expires'] or auth_data['used']:
-            del auth_codes[code]
-            return create_json_response({
-                "error": "invalid_grant"
-            }, 400)
-        
-        if auth_data['client_id'] != client_id:
-            return create_json_response({
-                "error": "invalid_client"
-            }, 400)
-        
-        auth_codes[code]['used'] = True
-        
-        access_token = secrets.token_urlsafe(32)
-        access_tokens[access_token] = {
-            "client_id": client_id,
-            "scope": auth_data['scope'],
-            "expires": datetime.now() + timedelta(hours=24)
-        }
-        
-        return create_json_response({
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": 86400,
-            "scope": auth_data['scope']
-        })
-        
-    except Exception as e:
-        return create_json_response({
-            "error": "server_error"
-        }, 500)
-
-# Main MCP endpoint
-@app.route("/", methods=["GET", "POST", "OPTIONS"])
-def mcp_endpoint():
-    if request.method == "OPTIONS":
-        return create_json_response({})
     
     if request.method == "POST":
-        auth_header = request.headers.get('Authorization')
-        
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return create_json_response({
-                "error": "invalid_token",
-                "error_description": "Missing or invalid access token"
-            }, 401)
-        
-        token = auth_header[7:]
-        if not verify_token(token):
-            return create_json_response({
-                "error": "invalid_token",
-                "error_description": "Token expired or invalid"
-            }, 401)
-        
         try:
             rpc_request = request.get_json()
+            if not rpc_request:
+                return create_json_response({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None
+                }, 400)
+            
             return handle_mcp_request(rpc_request)
+            
         except Exception as e:
             return create_json_response({
                 "jsonrpc": "2.0",
-                "error": {"code": -32603, "message": "Internal error"},
+                "error": {"code": -32603, "message": f"Internal error: {str(e)}"},
                 "id": None
             }, 500)
-    
-    # GET - server info
-    base_url = request.url_root.rstrip('/')
-    return create_json_response({
-        "name": "Redash Orders MCP Server",
-        "version": "1.0.0",
-        "description": "MCP server for Redash orders data",
-        "protocol": "Model Context Protocol v2024-11-05",
-        "auth": {
-            "type": "oauth2",
-            "required": True,
-            "flows": {
-                "authorizationCode": {
-                    "authorizationUrl": f"{base_url}/oauth/authorize",
-                    "tokenUrl": f"{base_url}/oauth/token"
-                }
-            }
-        }
-    })
 
 def handle_mcp_request(rpc_request):
-    """Handle MCP JSON-RPC requests"""
+    """Manejar peticiones JSON-RPC del protocolo MCP"""
     method = rpc_request.get('method')
     params = rpc_request.get('params', {})
     request_id = rpc_request.get('id')
@@ -368,19 +144,36 @@ def handle_mcp_request(rpc_request):
         return create_json_response({
             "jsonrpc": "2.0",
             "result": {
-                "tools": [{
-                    "name": "get_orders",
-                    "description": "Get orders data from Redash",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of orders"
+                "tools": [
+                    {
+                        "name": "get_orders",
+                        "description": "Get orders data from Redash query 3654",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Maximum number of orders to return",
+                                    "default": 10
+                                },
+                                "format": {
+                                    "type": "string",
+                                    "enum": ["summary", "detailed", "json"],
+                                    "description": "Output format",
+                                    "default": "summary"
+                                }
                             }
                         }
+                    },
+                    {
+                        "name": "get_orders_stats",
+                        "description": "Get statistical summary of orders data",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
                     }
-                }]
+                ]
             },
             "id": request_id
         })
@@ -390,43 +183,167 @@ def handle_mcp_request(rpc_request):
         args = params.get("arguments", {})
         
         if tool_name == "get_orders":
-            data = get_redash_data()
-            limit = args.get("limit", 10)
-            
-            orders = data.get("data", [])
-            if isinstance(limit, int):
-                orders = orders[:limit]
-            
-            result_text = f"📊 Orders Data ({len(orders)} records)\n\n"
-            for i, order in enumerate(orders[:5], 1):
-                result_text += f"{i}. {order}\n"
-            
+            return handle_get_orders(args, request_id)
+        
+        elif tool_name == "get_orders_stats":
+            return handle_get_orders_stats(request_id)
+        
+        else:
             return create_json_response({
                 "jsonrpc": "2.0",
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": result_text
-                    }]
-                },
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
                 "id": request_id
             })
     
+    else:
+        return create_json_response({
+            "jsonrpc": "2.0",
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+            "id": request_id
+        })
+
+def handle_get_orders(args, request_id):
+    """Manejar la herramienta get_orders"""
+    data = get_redash_data()
+    
+    if not data.get("success"):
+        return create_json_response({
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": f"❌ Error getting orders data: {data.get('error', 'Unknown error')}"
+                }]
+            },
+            "id": request_id
+        })
+    
+    orders = data.get("data", [])
+    limit = args.get("limit", 10)
+    format_type = args.get("format", "summary")
+    
+    # Aplicar límite
+    if isinstance(limit, int) and limit > 0:
+        orders = orders[:limit]
+    
+    # Formatear respuesta según el tipo
+    if format_type == "json":
+        result_text = f"📊 Orders Data (JSON format)\n\n```json\n{json.dumps(orders[:5], indent=2)}\n```"
+    
+    elif format_type == "detailed":
+        result_text = f"📊 Detailed Orders Data ({len(orders)} records)\n\n"
+        for i, order in enumerate(orders[:10], 1):
+            result_text += f"**Order {i}:**\n"
+            for key, value in order.items():
+                result_text += f"  - {key}: {value}\n"
+            result_text += "\n"
+    
+    else:  # summary
+        result_text = f"📊 Orders Summary ({len(orders)} records)\n\n"
+        if orders:
+            # Mostrar primeras 5 órdenes de forma resumida
+            for i, order in enumerate(orders[:5], 1):
+                # Intentar mostrar campos más relevantes
+                order_summary = []
+                for key, value in list(order.items())[:3]:  # Primeros 3 campos
+                    order_summary.append(f"{key}: {value}")
+                
+                result_text += f"{i}. {' | '.join(order_summary)}\n"
+            
+            if len(orders) > 5:
+                result_text += f"\n... y {len(orders) - 5} órdenes más\n"
+        
+        # Agregar metadata
+        metadata = data.get("metadata", {})
+        result_text += f"\n**Source:** {metadata.get('source', 'Unknown')}\n"
+        result_text += f"**Retrieved:** {metadata.get('retrieved_at', 'Unknown')}\n"
+        result_text += f"**Total columns:** {len(metadata.get('columns', []))}"
+    
     return create_json_response({
         "jsonrpc": "2.0",
-        "error": {"code": -32601, "message": f"Method not found: {method}"},
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": result_text
+            }]
+        },
+        "id": request_id
+    })
+
+def handle_get_orders_stats(request_id):
+    """Manejar la herramienta get_orders_stats"""
+    data = get_redash_data()
+    
+    if not data.get("success"):
+        return create_json_response({
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": f"❌ Error getting orders data: {data.get('error', 'Unknown error')}"
+                }]
+            },
+            "id": request_id
+        })
+    
+    orders = data.get("data", [])
+    metadata = data.get("metadata", {})
+    
+    # Calcular estadísticas básicas
+    total_records = len(orders)
+    columns = metadata.get("columns", [])
+    
+    result_text = f"📈 Orders Statistics\n\n"
+    result_text += f"**Total Records:** {total_records}\n"
+    result_text += f"**Total Columns:** {len(columns)}\n"
+    result_text += f"**Data Source:** {metadata.get('source', 'Unknown')}\n"
+    result_text += f"**Last Updated:** {metadata.get('retrieved_at', 'Unknown')}\n\n"
+    
+    if columns:
+        result_text += "**Available Columns:**\n"
+        for col in columns:
+            result_text += f"  • {col}\n"
+    
+    # Estadísticas adicionales si hay datos
+    if orders:
+        result_text += f"\n**Sample Data:**\n"
+        sample_order = orders[0]
+        for key, value in list(sample_order.items())[:5]:
+            result_text += f"  • {key}: {value} ({type(value).__name__})\n"
+    
+    return create_json_response({
+        "jsonrpc": "2.0",
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": result_text
+            }]
+        },
         "id": request_id
     })
 
 @app.route("/health")
 def health():
+    """Health check endpoint"""
     return create_json_response({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "environment": "render"
+        "environment": "render",
+        "auth_required": False
+    })
+
+# Endpoint de test para verificar la conexión a Redash
+@app.route("/test")
+def test_redash():
+    """Test endpoint para verificar la conexión a Redash"""
+    data = get_redash_data()
+    return create_json_response({
+        "test_result": data,
+        "timestamp": datetime.now().isoformat()
     })
 
 if __name__ == "__main__":
-    import time
     port = int(os.environ.get('PORT', 5000))
+    print(f"🚀 Starting MCP Server on port {port}")
+    print("📡 No authentication required")
     app.run(host='0.0.0.0', port=port, debug=False)
