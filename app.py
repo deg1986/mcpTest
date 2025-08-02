@@ -47,36 +47,89 @@ def get_redash_data():
         
         headers = {
             'User-Agent': 'MCP-Server/1.0',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
+            'Accept': 'application/json'
         }
         
         response = requests.get(url, timeout=30, headers=headers)
         print(f"📡 Redash response status: {response.status_code}")
+        print(f"📡 Response headers: {dict(response.headers)}")
         
-        response.raise_for_status()
+        if response.status_code != 200:
+            print(f"❌ HTTP Error: {response.status_code}")
+            return {
+                "success": False, 
+                "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                "data": []
+            }
+        
+        # Log raw response for debugging
+        response_text = response.text
+        print(f"📄 Response length: {len(response_text)} characters")
+        print(f"📄 Response preview: {response_text[:500]}...")
         
         raw_data = response.json()
         print(f"📊 Raw data structure: {list(raw_data.keys())}")
         
-        # Extraer datos anidados correctamente
+        # Debug the full structure
+        if "query_result" in raw_data:
+            query_result = raw_data["query_result"]
+            print(f"🔍 Query result keys: {list(query_result.keys())}")
+            
+            if "data" in query_result:
+                data_section = query_result["data"]
+                print(f"📋 Data section keys: {list(data_section.keys())}")
+                
+                rows = data_section.get("rows", [])
+                columns = data_section.get("columns", [])
+                
+                print(f"📈 Found {len(rows)} rows and {len(columns)} columns")
+                
+                # Log sample data
+                if rows:
+                    print(f"📝 Sample row: {rows[0] if len(rows) > 0 else 'None'}")
+                if columns:
+                    print(f"📝 Sample columns: {columns[:3] if len(columns) > 3 else columns}")
+            else:
+                print("❌ No 'data' key in query_result")
+                return {
+                    "success": False,
+                    "error": "Missing 'data' section in query_result",
+                    "data": [],
+                    "debug_info": {
+                        "query_result_keys": list(query_result.keys()),
+                        "full_response": raw_data
+                    }
+                }
+        else:
+            print("❌ No 'query_result' key in response")
+            return {
+                "success": False,
+                "error": "Missing 'query_result' in API response",
+                "data": [],
+                "debug_info": {
+                    "response_keys": list(raw_data.keys()),
+                    "full_response": raw_data
+                }
+            }
+        
+        # Extraer datos
         query_result = raw_data.get("query_result", {})
         data_section = query_result.get("data", {})
         rows = data_section.get("rows", [])
         columns = data_section.get("columns", [])
         
-        print(f"📈 Found {len(rows)} rows and {len(columns)} columns")
-        
         if not rows:
             print("⚠️ No rows found in response")
             return {
                 "success": False, 
-                "error": "No data found in Redash response",
+                "error": "No data rows found in Redash response",
                 "data": [],
                 "debug_info": {
                     "raw_keys": list(raw_data.keys()),
                     "query_result_keys": list(query_result.keys()) if query_result else [],
-                    "data_keys": list(data_section.keys()) if data_section else []
+                    "data_keys": list(data_section.keys()) if data_section else [],
+                    "rows_count": len(rows),
+                    "columns_count": len(columns)
                 }
             }
         
@@ -96,23 +149,33 @@ def get_redash_data():
         
         print(f"📋 Column names: {column_names}")
         
-        # Procesar filas
+        # Procesar filas - El API de Redash devuelve objetos directamente, no arrays
         processed_data = []
         for row_idx, row in enumerate(rows):
-            if not isinstance(row, (list, tuple)):
-                print(f"⚠️ Skipping invalid row {row_idx}: {type(row)}")
-                continue
-                
-            row_dict = {}
-            for i, value in enumerate(row):
-                if i < len(column_names):
-                    column_name = column_names[i]
+            if isinstance(row, dict):
+                # Row es ya un diccionario (formato actual de Redash)
+                print(f"✅ Processing row {row_idx} as dict: {list(row.keys())}")
+                row_dict = {}
+                for key, value in row.items():
+                    # Limpiar el nombre de la clave
+                    clean_key = str(key).strip().replace(' ', '_').replace('-', '_').lower()
                     cleaned_value = clean_value(value)
-                    row_dict[column_name] = cleaned_value
-            
-            # Solo agregar filas que tengan al menos un valor no vacío
-            if any(str(v).strip() for v in row_dict.values() if v):
+                    row_dict[clean_key] = cleaned_value
                 processed_data.append(row_dict)
+                
+            elif isinstance(row, (list, tuple)):
+                # Row es un array (formato alternativo)
+                print(f"✅ Processing row {row_idx} as array")
+                row_dict = {}
+                for i, value in enumerate(row):
+                    if i < len(column_names):
+                        column_name = column_names[i]
+                        cleaned_value = clean_value(value)
+                        row_dict[column_name] = cleaned_value
+                processed_data.append(row_dict)
+            else:
+                print(f"⚠️ Skipping invalid row {row_idx}: {type(row)} - {row}")
+                continue
         
         result = {
             "success": True,
@@ -123,11 +186,19 @@ def get_redash_data():
                 "source": "Redash Query 3654",
                 "retrieved_at": datetime.now().isoformat(),
                 "data_cleaned": True,
-                "query_id": "3654"
+                "query_id": "3654",
+                "debug": {
+                    "original_rows": len(rows),
+                    "processed_rows": len(processed_data),
+                    "columns_found": len(columns),
+                    "sample_raw_row": rows[0] if rows else None,
+                    "sample_processed_row": processed_data[0] if processed_data else None
+                }
             }
         }
         
         print(f"✅ Successfully processed {len(processed_data)} orders")
+        print(f"🔍 Sample processed data: {processed_data[0] if processed_data else 'None'}")
         
         # Actualizar cache
         data_cache = result
@@ -145,6 +216,8 @@ def get_redash_data():
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
         print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
         return {"success": False, "error": error_msg, "data": []}
 
 def create_mcp_response(data, status=200):
@@ -472,21 +545,38 @@ def format_order_summary(order, index=None):
 
 def handle_list_orders(args, request_id):
     """Listar órdenes con formato mejorado"""
+    print(f"🔧 list_orders called with args: {args}")
+    
     data = get_redash_data()
+    print(f"📊 get_redash_data returned: success={data.get('success')}, data_count={len(data.get('data', []))}")
     
     if not data.get("success"):
+        error_text = f"❌ **Error al obtener órdenes**\n\n**Error:** {data.get('error', 'Error desconocido')}\n\n"
+        
+        # Agregar información de debug si está disponible
+        if data.get('debug_info'):
+            error_text += f"*Información de debug:*\n```json\n{json.dumps(data.get('debug_info', {}), indent=2)}\n```\n\n"
+        
+        # Agregar sugerencias
+        error_text += "**Sugerencias:**\n"
+        error_text += "1. Verifica que el API de Redash esté funcionando\n"
+        error_text += "2. Comprueba la conectividad de red\n"
+        error_text += f"3. Visita `/test-redash` para diagnóstico directo\n"
+        error_text += f"4. Usa `/debug` para información detallada"
+        
         return create_mcp_response({
             "jsonrpc": "2.0",
             "result": {
                 "content": [{
                     "type": "text",
-                    "text": f"❌ **Error al obtener órdenes**\n\n**Error:** {data.get('error', 'Error desconocido')}\n\n*Información de debug:*\n```json\n{json.dumps(data.get('debug_info', {}), indent=2)}\n```"
+                    "text": error_text
                 }]
             },
             "id": request_id
         })
     
     orders = data.get("data", [])
+    print(f"📋 Processing {len(orders)} orders")
     
     # Validar argumentos
     try:
@@ -499,6 +589,8 @@ def handle_list_orders(args, request_id):
     if format_type not in ["summary", "detailed", "json"]:
         format_type = "summary"
     
+    print(f"🔧 Using limit={limit}, format={format_type}")
+    
     # Aplicar límite
     limited_orders = orders[:limit] if orders else []
     
@@ -510,16 +602,25 @@ def handle_list_orders(args, request_id):
         elif format_type == "detailed":
             result_text = f"📊 **Listado Detallado de Órdenes**\n\n**Total de órdenes:** {len(orders)}\n**Mostrando:** {len(limited_orders)}\n\n"
             
-            for i, order in enumerate(limited_orders, 1):
-                if not isinstance(order, dict):
-                    continue
-                    
-                result_text += f"### 📦 Orden #{i}\n"
-                for key, value in order.items():
-                    safe_key = str(key) if key is not None else "campo_desconocido"
-                    safe_value = str(value) if value is not None else "N/A"
-                    result_text += f"- **{safe_key}:** {safe_value}\n"
-                result_text += "\n"
+            if not limited_orders:
+                result_text += "*No hay órdenes para mostrar.*\n\n"
+                metadata = data.get("metadata", {})
+                if metadata.get("debug"):
+                    result_text += f"**Debug Info:**\n"
+                    result_text += f"- Filas originales: {metadata['debug'].get('original_rows', 'N/A')}\n"
+                    result_text += f"- Filas procesadas: {metadata['debug'].get('processed_rows', 'N/A')}\n"
+                    result_text += f"- Columnas encontradas: {metadata['debug'].get('columns_found', 'N/A')}\n"
+            else:
+                for i, order in enumerate(limited_orders, 1):
+                    if not isinstance(order, dict):
+                        continue
+                        
+                    result_text += f"### 📦 Orden #{i}\n"
+                    for key, value in order.items():
+                        safe_key = str(key) if key is not None else "campo_desconocido"
+                        safe_value = str(value) if value is not None else "N/A"
+                        result_text += f"- **{safe_key}:** {safe_value}\n"
+                    result_text += "\n"
         
         else:  # summary
             result_text = f"📋 **Lista de Órdenes**\n\n**Total encontradas:** {len(orders)}\n**Mostrando:** {len(limited_orders)}\n\n"
@@ -529,7 +630,24 @@ def handle_list_orders(args, request_id):
                     if isinstance(order, dict):
                         result_text += format_order_summary(order, i) + "\n"
             else:
-                result_text += "*No se encontraron órdenes.*\n"
+                result_text += "*No se encontraron órdenes.*\n\n"
+                
+                # Información de debug para troubleshooting
+                metadata = data.get("metadata", {})
+                if metadata.get("debug"):
+                    result_text += "**Información de Debug:**\n"
+                    debug_info = metadata["debug"]
+                    result_text += f"- Filas originales en respuesta: {debug_info.get('original_rows', 'N/A')}\n"
+                    result_text += f"- Filas después del procesamiento: {debug_info.get('processed_rows', 'N/A')}\n"
+                    result_text += f"- Columnas detectadas: {debug_info.get('columns_found', 'N/A')}\n"
+                    
+                    if debug_info.get('sample_raw_row'):
+                        result_text += f"- Muestra de fila cruda: `{str(debug_info['sample_raw_row'])[:100]}...`\n"
+                    
+                    if debug_info.get('sample_processed_row'):
+                        result_text += f"- Muestra de fila procesada: `{str(debug_info['sample_processed_row'])[:100]}...`\n"
+                    
+                    result_text += f"\n*Intenta usar el endpoint `/debug` para más información.*\n"
             
             # Información adicional
             metadata = data.get("metadata", {})
@@ -539,6 +657,10 @@ def handle_list_orders(args, request_id):
             result_text += f"**📊 Columnas disponibles:** {len(metadata.get('columns', []))}"
     
     except Exception as e:
+        print(f"❌ Error formatting response: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
         result_text = f"📊 **Lista de Órdenes**\n\n**Error de formato:** {str(e)}\n**Órdenes encontradas:** {len(orders)}\n\n*Los datos están disponibles pero hubo un problema al formatearlos. Intenta con formato 'json'.*"
     
     return create_mcp_response({
@@ -848,6 +970,178 @@ def test_redash():
     """Endpoint para probar la conexión con Redash directamente"""
     data = get_redash_data()
     return create_mcp_response(data)
+
+@app.route("/debug")
+def debug_endpoint():
+    """Endpoint para debugging completo"""
+    data = get_redash_data()
+    
+    debug_info = {
+        "connection_test": "OK" if data.get("success") else "FAILED",
+        "error": data.get("error"),
+        "data_count": len(data.get("data", [])),
+        "metadata": data.get("metadata", {}),
+        "sample_data": data.get("data", [])[:2] if data.get("data") else [],
+        "cache_info": {
+            "has_cache": data_cache is not None,
+            "cache_age_seconds": time.time() - cache_time if cache_time else None
+        }
+    }
+    
+    return create_mcp_response(debug_info)
+
+@app.route("/force-refresh")
+def force_refresh():
+    """Forzar actualización del cache"""
+    global data_cache, cache_time
+    data_cache = None
+    cache_time = None
+    data = get_redash_data()
+    return create_mcp_response({
+        "message": "Cache cleared and data refreshed",
+        "success": data.get("success"),
+        "data_count": len(data.get("data", []))
+    })
+
+# Endpoints REST para probar las herramientas MCP directamente
+@app.route("/api/list-orders")
+def api_list_orders():
+    """REST endpoint para listar órdenes"""
+    limit = request.args.get('limit', 20, type=int)
+    format_type = request.args.get('format', 'summary')
+    
+    args = {"limit": limit, "format": format_type}
+    mcp_response = handle_list_orders(args, "api-test")
+    
+    # Extraer el contenido de la respuesta MCP
+    content = mcp_response.get_data(as_text=True)
+    return content
+
+@app.route("/api/search-by-order/<order_number>")
+def api_search_by_order(order_number):
+    """REST endpoint para buscar por número de orden"""
+    exact_match = request.args.get('exact', 'false').lower() == 'true'
+    limit = request.args.get('limit', 10, type=int)
+    
+    args = {
+        "order_number": order_number,
+        "exact_match": exact_match,
+        "limit": limit
+    }
+    mcp_response = handle_search_by_order_number(args, "api-test")
+    
+    content = mcp_response.get_data(as_text=True)
+    return content
+
+@app.route("/api/search-by-email/<email>")
+def api_search_by_email(email):
+    """REST endpoint para buscar por email"""
+    exact_match = request.args.get('exact', 'false').lower() == 'true'
+    limit = request.args.get('limit', 10, type=int)
+    
+    args = {
+        "email": email,
+        "exact_match": exact_match,
+        "limit": limit
+    }
+    mcp_response = handle_search_by_email(args, "api-test")
+    
+    content = mcp_response.get_data(as_text=True)
+    return content
+
+@app.route("/api/orders-stats")
+def api_orders_stats():
+    """REST endpoint para estadísticas"""
+    mcp_response = handle_get_orders_stats("api-test")
+    content = mcp_response.get_data(as_text=True)
+    return content
+
+@app.route("/endpoints")
+def list_endpoints():
+    """Listar todos los endpoints disponibles"""
+    endpoints = {
+        "mcp_endpoints": {
+            "root": {
+                "url": "/",
+                "methods": ["GET", "POST", "OPTIONS"],
+                "description": "Endpoint principal MCP para Claude Desktop"
+            }
+        },
+        "debug_endpoints": {
+            "health": {
+                "url": "/health",
+                "methods": ["GET"],
+                "description": "Health check del servidor"
+            },
+            "mcp_info": {
+                "url": "/mcp-info",
+                "methods": ["GET"],
+                "description": "Información del servidor MCP"
+            },
+            "test_redash": {
+                "url": "/test-redash",
+                "methods": ["GET"],
+                "description": "Probar conexión directa con Redash"
+            },
+            "debug": {
+                "url": "/debug",
+                "methods": ["GET"],
+                "description": "Información completa de debugging"
+            },
+            "force_refresh": {
+                "url": "/force-refresh",
+                "methods": ["GET"],
+                "description": "Limpiar cache y refrescar datos"
+            },
+            "endpoints": {
+                "url": "/endpoints",
+                "methods": ["GET"],
+                "description": "Listar todos los endpoints (este endpoint)"
+            }
+        },
+        "api_endpoints": {
+            "list_orders": {
+                "url": "/api/list-orders",
+                "methods": ["GET"],
+                "description": "Listar órdenes",
+                "parameters": {
+                    "limit": "Número máximo de órdenes (default: 20)",
+                    "format": "Formato: summary, detailed, json (default: summary)"
+                }
+            },
+            "search_by_order": {
+                "url": "/api/search-by-order/<order_number>",
+                "methods": ["GET"],
+                "description": "Buscar órdenes por número",
+                "parameters": {
+                    "exact": "Búsqueda exacta: true/false (default: false)",
+                    "limit": "Número máximo de resultados (default: 10)"
+                }
+            },
+            "search_by_email": {
+                "url": "/api/search-by-email/<email>",
+                "methods": ["GET"],
+                "description": "Buscar órdenes por email",
+                "parameters": {
+                    "exact": "Búsqueda exacta: true/false (default: false)",
+                    "limit": "Número máximo de resultados (default: 10)"
+                }
+            },
+            "orders_stats": {
+                "url": "/api/orders-stats",
+                "methods": ["GET"],
+                "description": "Estadísticas de órdenes"
+            }
+        },
+        "mcp_tools": [
+            "list_orders",
+            "search_orders_by_number", 
+            "search_orders_by_email",
+            "get_orders_stats"
+        ]
+    }
+    
+    return create_mcp_response(endpoints)
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
